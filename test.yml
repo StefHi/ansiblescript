@@ -1,0 +1,8 @@
+---
+- name: Test playbook that does nothing
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Do nothing
+      debug:
+        msg: "This playbook ran successfully and did nothing."
