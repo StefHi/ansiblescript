@@ -1,0 +1,162 @@
+---
+- name: Prepare GPU VM for Dockerized Faster-Whisper
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ubuntu_min_version: "22.04"
+    set_nvidia_default_runtime: false  # set true to write daemon.json with "nvidia" runtime
+
+  pre_tasks:
+    - name: Ensure Ubuntu {{ ubuntu_min_version }} or newer
+      assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version is version(ubuntu_min_version, ">=")
+        fail_msg: "This playbook expects Ubuntu {{ ubuntu_min_version }} or newer."
+
+    - name: Update/upgrade base system
+      apt:
+        update_cache: yes
+        upgrade: dist
+      register: _apt_upgrade
+      until: _apt_upgrade is not failed
+      retries: 5
+      delay: 15
+
+    - name: Install base utilities
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+        state: present
+        update_cache: yes
+
+  tasks:
+    # ---------- NVIDIA driver (skip if already present) ----------
+    - name: Check if NVIDIA driver works
+      command: nvidia-smi
+      register: nvidia_smi_present
+      ignore_errors: true
+      changed_when: false
+
+    - name: Install Ubuntu packaged NVIDIA driver (if absent)
+      when: nvidia_smi_present.rc != 0
+      block:
+        - name: Install ubuntu-drivers-common
+          apt:
+            name: ubuntu-drivers-common
+            state: present
+            update_cache: yes
+
+        - name: Autoinstall recommended NVIDIA driver
+          command: ubuntu-drivers install --gpgpu
+          register: ubuntu_drivers_install
+          changed_when: "'No drivers found' not in ubuntu_drivers_install.stdout"
+
+        - name: Flag reboot after driver install
+          set_fact:
+            nvidia_reboot_needed: true
+
+    - name: Reboot if driver was installed
+      when: nvidia_reboot_needed | default(false)
+      reboot:
+        msg: "Rebooting to load NVIDIA driver modules"
+        reboot_timeout: 1200
+
+    - name: Verify NVIDIA driver after reboot
+      command: nvidia-smi
+      register: nvidia_smi_after
+      changed_when: false
+
+    - name: Fail if NVIDIA driver still not functional
+      when: nvidia_smi_after.rc != 0
+      fail:
+        msg: "NVIDIA driver not available after install/reboot. Investigate host driver setup."
+
+    # ---------- Docker Engine + Compose v2 ----------
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker apt repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
+        state: present
+
+    - name: Install Docker engine and Compose v2 plugin
+      apt:
+        name:
+          - docker-ce            # Docker daemon
+          - docker-ce-cli        # Docker client CLI
+          - containerd.io        # OCI runtime used by Docker
+          - docker-compose-plugin  # "docker compose" subcommand
+          # - docker-buildx-plugin  # OPTIONAL: advanced builds/multi-arch
+        state: present
+        update_cache: yes
+
+    - name: Enable & restart Docker
+      systemd:
+        name: docker
+        state: restarted
+        enabled: yes
+
+    # ---------- NVIDIA Container Toolkit ----------
+    - name: Add NVIDIA Container Toolkit apt key & repo
+      shell: |
+        set -e
+        distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        curl -fsSL https://nvidia.github.io/libnvidia-container/${distribution}/libnvidia-container.list \
+          | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' \
+          | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+        apt-get update
+      args:
+        executable: /bin/bash
+
+    - name: Install nvidia-container-toolkit
+      apt:
+        name: nvidia-container-toolkit
+        state: present
+        update_cache: yes
+
+    - name: Optionally set Docker default NVIDIA runtime
+      when: set_nvidia_default_runtime
+      copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: |
+          {
+            "runtimes": {
+              "nvidia": {
+                "path": "nvidia-container-runtime",
+                "runtimeArgs": []
+              }
+            }
+          }
+
+    - name: Restart Docker after NVIDIA toolkit
+      systemd:
+        name: docker
+        state: restarted
+        enabled: yes
+
+    # ---------- Validation ----------
+    - name: Confirm GPU visible inside container
+      shell: docker run --rm --gpus all nvidia/cuda:12.3.2-runtime-ubuntu22.04 nvidia-smi
+      register: nvidia_in_container
+      changed_when: false
+
+    - name: Show nvidia-smi from inside container
+      debug:
+        var: nvidia_in_container.stdout
+
+    - name: Fail if GPU not visible inside container
+      when: nvidia_in_container.rc != 0
+      fail:
+        msg: "GPU not visible inside Docker. Check NVIDIA Container Toolkit & Docker setup."
